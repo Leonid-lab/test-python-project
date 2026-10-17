@@ -80,104 +80,114 @@ async def process_payment_message(
 
     payment_id = parsed["payment_id"]
     attempt = parsed["attempt"]
-    event_id = parsed["event_id"]
 
     async with session_factory() as session:
         payment = await get_payment_by_id(session, payment_id)
         if payment is None:
             logger.warning("payment not found %s", payment_id)
-            await msg.reject(requeue=False)
-            return
+            missing = True
+            terminal = False
+            webhook_status = None
+        else:
+            missing = False
+            terminal = is_terminal(payment.status)
+            webhook_status = payment.webhook_status
 
-        if payment.webhook_status == WebhookStatus.exhausted.value:
-            await msg.reject(requeue=False)
-            return
+    if missing:
+        await msg.reject(requeue=False)
+        return
+    if webhook_status == WebhookStatus.exhausted.value:
+        await msg.reject(requeue=False)
+        return
+    if webhook_status == WebhookStatus.delivered.value:
+        await msg.ack()
+        return
 
-        if payment.webhook_status == WebhookStatus.delivered.value:
-            await msg.ack()
+    if not terminal:
+        try:
+            outcome = await emulate_gateway(payment_id)
+        except Exception:
+            await msg.nack(requeue=True)
             return
-
-        if not is_terminal(payment.status):
-            try:
-                outcome = await emulate_gateway(payment_id)
-            except Exception:
-                await session.rollback()
-                await msg.nack(requeue=True)
-                return
-            finalized = await finalize_payment_if_pending(session, payment_id, outcome)
+        async with session_factory() as session:
+            await finalize_payment_if_pending(session, payment_id, outcome)
             await session.commit()
-            if not finalized:
-                await session.refresh(payment)
-            payment = await get_payment_by_id(session, payment_id)
-            if payment is None:
-                await msg.nack(requeue=True)
-                return
 
     async with session_factory() as session:
         payment = await get_payment_by_id(session, payment_id)
         if payment is None:
-            await msg.nack(requeue=True)
-            return
-        if payment.webhook_status == WebhookStatus.delivered.value:
-            await msg.ack()
-            return
-        if payment.webhook_status == WebhookStatus.exhausted.value:
-            await msg.reject(requeue=False)
-            return
+            snapshot = None
+        else:
+            snapshot = {
+                "webhook_url": payment.webhook_url,
+                "payload": build_webhook_payload(payment),
+                "event_id": str(payment.webhook_event_id),
+                "webhook_status": payment.webhook_status,
+            }
 
-        payload = build_webhook_payload(payment)
-        try:
-            await post_webhook(
-                payment.webhook_url,
-                payload,
-                event_id=str(payment.webhook_event_id),
-                settings=settings,
-            )
-        except WebhookDeliveryError as e:
-            async with session_factory() as err_session:
-                if not e.retryable:
-                    await mark_webhook_exhausted(err_session, payment_id, str(e))
-                    await err_session.commit()
-                    await msg.ack()
-                    return
-                new_count = await increment_webhook_attempt(err_session, payment_id, str(e))
+    if snapshot is None:
+        await msg.nack(requeue=True)
+        return
+    if snapshot["webhook_status"] == WebhookStatus.delivered.value:
+        await msg.ack()
+        return
+    if snapshot["webhook_status"] == WebhookStatus.exhausted.value:
+        await msg.reject(requeue=False)
+        return
+
+    try:
+        await post_webhook(
+            snapshot["webhook_url"],
+            snapshot["payload"],
+            event_id=snapshot["event_id"],
+            settings=settings,
+        )
+    except WebhookDeliveryError as e:
+        async with session_factory() as err_session:
+            if not e.retryable:
+                await mark_webhook_exhausted(err_session, payment_id, str(e))
                 await err_session.commit()
-                if new_count is None:
-                    payment2 = await get_payment_by_id(err_session, payment_id)
-                    if payment2 and payment2.webhook_status == WebhookStatus.delivered.value:
-                        await msg.ack()
-                        return
-                    await mark_webhook_exhausted(err_session, payment_id, str(e))
-                    await err_session.commit()
-                    await msg.reject(requeue=False)
-                    return
-                if attempt >= 3:
-                    await mark_webhook_exhausted(err_session, payment_id, str(e))
-                    await err_session.commit()
-                    await msg.reject(requeue=False)
-                    return
-                retry_body = {
-                    "version": OUTBOX_PAYLOAD_VERSION,
-                    "event_id": event_id,
-                    "payment_id": str(payment_id),
-                    "attempt": attempt + 1,
-                }
-                try:
-                    await publish_retry_event(
-                        channel,
-                        retry_body,
-                        attempt + 1,
-                        timeout=settings.outbox_publish_timeout_sec,
-                    )
-                except Exception:
-                    await msg.nack(requeue=True)
-                    return
                 await msg.ack()
                 return
-        except Exception:
-            await msg.nack(requeue=True)
+            new_count = await increment_webhook_attempt(err_session, payment_id, str(e))
+            await err_session.commit()
+            if new_count is None:
+                payment2 = await get_payment_by_id(err_session, payment_id)
+                if payment2 and payment2.webhook_status == WebhookStatus.delivered.value:
+                    await msg.ack()
+                    return
+                await mark_webhook_exhausted(err_session, payment_id, str(e))
+                await err_session.commit()
+                await msg.reject(requeue=False)
+                return
+            if attempt >= 3:
+                await mark_webhook_exhausted(err_session, payment_id, str(e))
+                await err_session.commit()
+                await msg.reject(requeue=False)
+                return
+            retry_body = {
+                "version": OUTBOX_PAYLOAD_VERSION,
+                "event_id": snapshot["event_id"],
+                "payment_id": str(payment_id),
+                "attempt": attempt + 1,
+            }
+            try:
+                await publish_retry_event(
+                    channel,
+                    retry_body,
+                    attempt + 1,
+                    timeout=settings.outbox_publish_timeout_sec,
+                )
+            except Exception:
+                await msg.nack(requeue=True)
+                return
+            await msg.ack()
             return
+    except Exception:
+        await msg.nack(requeue=True)
+        return
 
+    async with session_factory() as session:
         await mark_webhook_delivered(session, payment_id)
         await session.commit()
-        await msg.ack()
+    await msg.ack()

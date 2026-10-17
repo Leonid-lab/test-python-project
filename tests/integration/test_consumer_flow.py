@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aio_pika import DeliveryMode, Message
+from sqlalchemy import text
 
 from app.gateway import simulator as sim
 from app.messaging.constants import EXCHANGE_EVENTS, QUEUE_DLQ, QUEUE_NEW, RK_NEW
@@ -56,6 +57,57 @@ async def _process(
     msg = FakeMessage(body=build_message_body(payment_id, event_id, attempt))
     await process_payment_message(channel, msg, session_factory, test_settings)
     return msg
+
+
+@pytest.mark.asyncio
+async def test_io_does_not_hold_db_transaction(
+    session_factory, test_settings, rabbit_connection, webhook_mock, monkeypatch
+):
+    """Gateway sleep and webhook HTTP must not leave a payments transaction open."""
+
+    async def _idle_payment_tx() -> int:
+        async with session_factory() as session:
+            return int(
+                await session.scalar(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND state = 'idle in transaction'
+                          AND query ILIKE '%payments%'
+                        """
+                    )
+                )
+                or 0
+            )
+
+    seen: list[int] = []
+
+    async def checking_sleep(_duration: float) -> None:
+        seen.append(await _idle_payment_tx())
+
+    _, webhook_url = webhook_mock
+    payment_id, event_id = await _create_pending(session_factory, webhook_url)
+    sim.set_gateway_test_hooks(checking_sleep, _ForcedOutcome(PaymentStatus.succeeded.value))
+    channel = await rabbit_connection.channel(publisher_confirms=True)
+
+    from app.messaging import processing
+
+    async def checking_post(*args, **kwargs):
+        seen.append(await _idle_payment_tx())
+        await processing_post(*args, **kwargs)
+
+    processing_post = processing.post_webhook
+    monkeypatch.setattr(processing, "post_webhook", checking_post)
+    try:
+        msg = await _process(channel, session_factory, test_settings, payment_id, event_id)
+    finally:
+        sim.clear_gateway_test_hooks()
+        await channel.close()
+
+    assert msg.acked
+    assert seen == [0, 0]
 
 
 @pytest.mark.asyncio
